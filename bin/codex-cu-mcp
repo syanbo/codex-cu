@@ -1,0 +1,130 @@
+#!/usr/bin/python3
+# 每次启动时从 Codex 插件缓存里最新版本的 .mcp.json 读取 cua_repl 配置再启动，
+# ChatGPT 更新后版本号和 env 跟着变，不必重新注册 MCP。
+# 同时代理 stdio：用户接受应用授权请求时补上 persist=always，由 Codex 写入永久授权名单，
+# 因为 Claude Code 的授权弹窗只有 Accept/Decline，没有 Codex 的「始终允许」选项。
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+PLUGIN_DIR = Path.home() / ".codex/plugins/cache/openai-bundled/unified-computer-use"
+SERVER_KEY = "cua_repl"
+APP_APPROVAL = re.compile(r'^Allow Computer Use to use "(.+)"\?$')
+
+
+def version_key(name):
+    # 按数字比较版本，避免字符串排序把 26.930 排在 26.1001 之后
+    try:
+        return tuple(int(part) for part in name.split("."))
+    except ValueError:
+        return None
+
+
+def resolve():
+    candidates = []
+    for entry in (PLUGIN_DIR.iterdir() if PLUGIN_DIR.is_dir() else []):
+        key = version_key(entry.name)
+        config = entry / ".mcp.json"
+        # 更新过程中新版本目录可能先出现、配置后写入，没有配置的目录跳过
+        if key is not None and config.is_file():
+            candidates.append((key, config))
+    if not candidates:
+        sys.exit(f"codex-cu: no versioned .mcp.json under {PLUGIN_DIR}")
+    _, config = max(candidates)
+    servers = json.loads(config.read_text())["mcpServers"]
+    if SERVER_KEY not in servers:
+        sys.exit(f"codex-cu: {config} has no {SERVER_KEY}, found {sorted(servers)}")
+    return config, servers[SERVER_KEY]
+
+
+def is_persistable_app_approval(params):
+    meta = params.get("_meta") or {}
+    if meta.get("connector_id") == "computer-use":
+        # 录音授权没有 app 参数；Codex 不允许永久授权的应用 persist 里没有 always
+        return bool((meta.get("tool_params") or {}).get("app")) and "always" in (meta.get("persist") or [])
+    return bool(APP_APPROVAL.match(params.get("message", "")))
+
+
+def upgrade_response(line, pending, lock):
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return line
+    key = json.dumps(message.get("id"))
+    with lock:
+        if key not in pending:
+            return line
+        pending.discard(key)
+    result = message.get("result")
+    if not isinstance(result, dict) or result.get("action") != "accept":
+        return line
+    meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
+    result["_meta"] = {**meta, "persist": "always"}
+    return (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+
+def proxy(argv, env):
+    child = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+    pending = set()
+    lock = threading.Lock()
+
+    def server_to_client():
+        for line in child.stdout:
+            if b'"elicitation/create"' in line:
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    message = {}
+                if (message.get("method") == "elicitation/create" and "id" in message
+                        and is_persistable_app_approval(message.get("params") or {})):
+                    # 先登记再转发，保证客户端的回复到达时已经能匹配上
+                    with lock:
+                        pending.add(json.dumps(message["id"]))
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+        # 服务端退出后主线程还卡在读 stdin，直接退出进程，客户端才能读到 EOF 发现服务断开
+        code = child.wait()
+        os._exit(code if code >= 0 else 128 - code)
+
+    threading.Thread(target=server_to_client, daemon=True).start()
+    try:
+        for line in sys.stdin.buffer:
+            if pending and b'"result"' in line:
+                line = upgrade_response(line, pending, lock)
+            child.stdin.write(line)
+            child.stdin.flush()
+        child.stdin.close()
+    except BrokenPipeError:
+        pass
+    # 客户端关闭 stdin 后等服务端自行退出，退出码由读线程的 os._exit 带出
+    child.wait()
+    threading.Event().wait(5)
+    return child.returncode
+
+
+def main():
+    config, server = resolve()
+    argv = [server["command"], *server.get("args", [])]
+    server_env = server.get("env", {})
+    if "--dry-run" in sys.argv[1:]:
+        print(json.dumps({
+            "config": str(config),
+            "argv": argv,
+            "app_version": server_env.get("BROWSER_USE_CODEX_APP_VERSION"),
+            "env_keys": sorted(server_env),
+        }, indent=2))
+        return
+    if not os.access(argv[0], os.X_OK):
+        sys.exit(f"codex-cu: {argv[0]} is not executable, check ChatGPT.app")
+    sys.exit(proxy(argv, {**os.environ, **server_env}))
+
+
+if __name__ == "__main__":
+    main()
